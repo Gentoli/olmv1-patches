@@ -1,0 +1,178 @@
+name: Build OLMv1 Transform Catalog
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'packages/*.yaml'
+  schedule:
+    - cron: '0 1 * * 6'
+  workflow_dispatch:
+    inputs:
+      base_catalog:
+        description: 'Base OLMv0 catalog image'
+        required: true
+        default: 'quay.io/operatorhubio/catalog:latest'
+
+env:
+  REGISTRY: ghcr.io
+  PATCH_DIR: packages
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set lowercased Image Base
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_BASE=ghcr.io/${OWNER_LC}/olmv1-patches/operatorhub" >> $GITHUB_ENV
+
+      - name: Install OPM
+        run: |
+          curl -L -o opm https://github.com/operator-framework/operator-registry/releases/latest/download/linux-amd64-opm
+          chmod +x opm
+          sudo mv opm /usr/local/bin/
+
+      - name: Install Node.js dependencies
+        run: npm install yaml fast-json-patch
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract OLMv0 Catalog and Filter
+        run: |
+          set -e
+          WORKSPACE="${{ github.workspace }}/final_catalog"
+          mkdir -p "$WORKSPACE"
+          
+          PKG_ARRAY=$(find "$PATCH_DIR" -maxdepth 1 -name '*.yaml' -exec basename {} .yaml \; | jq -R . | jq -s -c .)
+          BASE_CATALOG="${{ github.event.inputs.base_catalog || 'quay.io/operatorhubio/catalog:latest' }}"
+          
+          opm render "$BASE_CATALOG" -o json | \
+            jq -c --argjson pkgs "$PKG_ARRAY" \
+            '(. | if type == "array" then .[] else . end) | select(type == "object") | select(.package as $p | .name as $n | .schema as $s | $pkgs | any(. == $p or ($s == "olm.package" and . == $n)))' \
+            > filtered_stream.json
+
+      - name: Apply OLMv1 Transform Patches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const yaml = require('yaml');
+            const jsonpatch = require('fast-json-patch');
+
+            const inFile = 'filtered_stream.json';
+            const patchDir = '${{ env.PATCH_DIR }}';
+            const outFile = '${{ github.workspace }}/final_catalog/catalog.json';
+
+            const rulesByPackage = {};
+            if (fs.existsSync(patchDir)) {
+              const files = fs.readdirSync(patchDir);
+              for (const file of files) {
+                if (file.endsWith('.yaml')) {
+                  const pkgName = path.basename(file, '.yaml');
+                  const content = fs.readFileSync(path.join(patchDir, file), 'utf8');
+                  const rules = yaml.parse(content);
+                  if (Array.isArray(rules)) {
+                    rulesByPackage[pkgName] = rules;
+                  }
+                }
+              }
+            }
+
+            const fileContent = fs.readFileSync(inFile, 'utf8');
+            const lines = fileContent.split('\n').filter(line => line.trim() !== '');
+            const objs = lines.map(line => JSON.parse(line));
+
+            let appliedCount = 0;
+            for (let i = 0; i < objs.length; i++) {
+              let obj = objs[i];
+              const objPkgName = obj.schema === 'olm.package' ? obj.name : obj.package;
+              const rules = rulesByPackage[objPkgName] || [];
+              
+              for (const rule of rules) {
+                const target = rule.target || {};
+                let isMatch = true;
+                for (const [key, value] of Object.entries(target)) {
+                  if (obj[key] !== value) {
+                    isMatch = false;
+                    break;
+                  }
+                }
+                
+                if (isMatch) {
+                  const standardPatches = [];
+                  const patchOps = rule.patch || [];
+                  for (const p of patchOps) {
+                    if (p.op === 'remove-items') {
+                       const arrayKey = p.path.replace(/^\//, '');
+                       if (Array.isArray(obj[arrayKey])) {
+                         obj[arrayKey] = obj[arrayKey].filter(item => {
+                           let itemMatches = true;
+                           for (const [k, v] of Object.entries(p.match || {})) {
+                             if (item[k] !== v) itemMatches = false;
+                           }
+                           return !itemMatches;
+                         });
+                         appliedCount++;
+                       }
+                    } else {
+                       standardPatches.push(p);
+                    }
+                  }
+                  if (standardPatches.length > 0) {
+                    const result = jsonpatch.applyPatch(obj, standardPatches, false, false);
+                    obj = result.newDocument;
+                    appliedCount += standardPatches.length;
+                  }
+                  objs[i] = obj;
+                }
+              }
+            }
+            console.log(`Applied ${appliedCount} patches.`);
+            const outStream = fs.createWriteStream(outFile);
+            for (const obj of objs) {
+              outStream.write(JSON.stringify(obj) + '\n');
+            }
+            outStream.end();
+
+      - name: Validate and Visualize Upgrade Graphs
+        run: |
+          set -e
+          WORKSPACE="${{ github.workspace }}/final_catalog"
+          
+          opm validate "$WORKSPACE"
+          
+          for patch_file in packages/*.yaml; do
+            [ -e "$patch_file" ] || continue
+            PKG_NAME=$(basename "$patch_file" .yaml)
+            echo ">>> Package: $PKG_NAME"
+            opm alpha render-graph "$WORKSPACE" -p "$PKG_NAME"
+            echo -e "\n"
+          done
+
+      - name: Build OLMv1 Transformed Image
+        run: |
+          set -e
+          WORKSPACE="${{ github.workspace }}/final_catalog"
+          opm generate dockerfile "$WORKSPACE"
+          
+          IMAGE_TAG="${{ github.sha }}"
+          FULL_IMAGE="${{ env.IMAGE_BASE }}:$IMAGE_TAG"
+          LATEST_IMAGE="${{ env.IMAGE_BASE }}:latest"
+          
+          docker build -t "$FULL_IMAGE" -t "$LATEST_IMAGE" -f final_catalog.Dockerfile .
+          docker push "$FULL_IMAGE"
+          docker push "$LATEST_IMAGE"

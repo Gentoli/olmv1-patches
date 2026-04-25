@@ -1,0 +1,9 @@
+# Patch out olm.gvk.required which only checks for cert-manager CRDs
+# https://github.com/operator-framework/operator-controller/blob/7277a46af0d0cca9d7bd2adfa29ccaba65fb5654/docs/project/olmv1_limitations.md
+- target:
+    schema: olm.bundle
+  patch:
+    - op: remove-items
+      path: /properties
+      match:
+        type: olm.gvk.required
